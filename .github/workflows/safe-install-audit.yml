@@ -1,0 +1,67 @@
+name: Safe-install audit
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Fetch the reviewed commit without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -c core.hooksPath=/dev/null clone --no-checkout https://github.com/lstunn25ai/animate.git "$RUNNER_TEMP/animate-source"
+          git -C "$RUNNER_TEMP/animate-source" -c core.hooksPath=/dev/null checkout --detach 7e5eb56feb2dd573f890e1b7b34748af43d58263
+          test "$(git -C "$RUNNER_TEMP/animate-source" rev-parse HEAD)" = 7e5eb56feb2dd573f890e1b7b34748af43d58263
+          mkdir -p "$RUNNER_TEMP/animate-audit"
+          chmod 0777 "$RUNNER_TEMP/animate-audit"
+          cat > "$RUNNER_TEMP/animate-audit/check.mjs" <<'AUDIT_SCRIPT'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import vm from 'node:vm';
+          import crypto from 'node:crypto';
+          import {spawnSync} from 'node:child_process';
+          const root='/work/skill';
+          fs.cpSync('/source/plugins/animate/skills/animate',root,{recursive:true});
+          function walk(dir){return fs.readdirSync(dir,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(path.join(dir,e.name)):[path.join(dir,e.name)]);}
+          const scripts=walk(root).filter(f=>f.endsWith('.mjs'));
+          for(const file of scripts){const r=spawnSync(process.execPath,['--check',file],{encoding:'utf8',env:{PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/tmp/home'}});if(r.status!==0)throw new Error(path.relative(root,file)+'\n'+r.stderr);}
+          const hash=s=>crypto.createHash('sha256').update(s).digest('hex');
+          const demos=fs.readdirSync(path.join(root,'styles')).filter(n=>fs.existsSync(path.join(root,'styles',n,'demo','piece.json')));
+          const results=[];
+          for(const style of demos){
+           const piece='/work/pieces/'+style;
+           fs.cpSync(path.join(root,'styles',style,'demo'),piece,{recursive:true});
+           const run=()=>spawnSync(process.execPath,[path.join(root,'tools/build.mjs'),piece],{encoding:'utf8',env:{PATH:'/usr/local/bin:/usr/bin:/bin',HOME:'/tmp/home'},timeout:30000});
+           const first=run();if(first.status!==0)throw new Error(style+': '+first.stderr);
+           const before=fs.readFileSync(path.join(piece,'index.html'),'utf8');
+           const second=run();if(second.status!==0)throw new Error(style+': '+second.stderr);
+           const after=fs.readFileSync(path.join(piece,'index.html'),'utf8');
+           if(hash(before)!==hash(after))throw new Error(style+': nondeterministic build');
+           const script=before.match(/<script>([\s\S]*)<\/script>/);
+           if(!script)throw new Error(style+': missing script');
+           new vm.Script(script[1],{filename:style+'.html'});
+           results.push({style,bytes:Buffer.byteLength(before),sha256:hash(before)});
+          }
+          if(results.length!==7)throw new Error('Expected seven built-in styles');
+          console.log(JSON.stringify({scope:'isolated syntax, build and repeatability checks; not a browser or MP4 test',node:process.version,checkedMjs:scripts.length,demos:results},null,2));
+          
+          AUDIT_SCRIPT
+      - name: Pull a fixed official runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df
+          docker image inspect node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df --format '{{index .RepoDigests 0}}'
+      - name: Run without network, user files, tokens or elevated privileges
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 128 --memory 1g --cpus 2 \
+            --user 65534:65534 --tmpfs /tmp:rw,nosuid,noexec,size=128m \
+            --mount type=bind,src="$RUNNER_TEMP/animate-source",dst=/source,readonly \
+            --mount type=bind,src="$RUNNER_TEMP/animate-audit",dst=/work \
+            --env HOME=/tmp/home --workdir /work \
+            node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df node /work/check.mjs
